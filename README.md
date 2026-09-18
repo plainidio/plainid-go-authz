@@ -23,6 +23,7 @@ of its own.
 |---|---|---|
 | `github.com/plainidio/plainid-go-authz/plainid` | `plainid` | Core: configuration, PDP client, payload, decision. No framework dependency. |
 | `github.com/plainidio/plainid-go-authz/middleware/nethttp` | `plainidhttp` | `net/http` middleware — also covers chi, gorilla/mux and `httputil.ReverseProxy`, which all speak `http.Handler`. |
+| `github.com/plainidio/plainid-go-authz/middleware/fasthttp` | `plainidfasthttp` | `fasthttp` middleware. **A separate Go module**, so `net/http` users never inherit the fasthttp dependency. |
 
 Adapters are named `plainid<framework>` (`plainidhttp`, and `plainidfasthttp`,
 `plainidgin` as they arrive) so they never collide with the framework's own
@@ -36,6 +37,7 @@ import plainidhttp "github.com/plainidio/plainid-go-authz/middleware/nethttp"
 ```
 plainid/              core, framework-neutral
 middleware/nethttp/   the net/http adapter
+middleware/fasthttp/  the fasthttp adapter — its own go.mod
 internal/authztest/   the contract suite every adapter must pass
 examples/             runnable servers
 ```
@@ -43,10 +45,13 @@ examples/             runnable servers
 ## Install
 
 ```bash
-go get github.com/plainidio/plainid-go-authz/middleware/nethttp
+go get github.com/plainidio/plainid-go-authz/middleware/nethttp    # net/http, chi, …
+go get github.com/plainidio/plainid-go-authz/middleware/fasthttp   # fasthttp
 ```
 
-Zero dependencies beyond the standard library. Go 1.22+.
+The core and the `net/http` adapter have **zero dependencies beyond the
+standard library**; only the fasthttp module pulls anything in, and only for
+projects that ask for it. Go 1.22+.
 
 ## Use
 
@@ -281,6 +286,9 @@ Core helpers an adapter needs: `ReadCappedBody` (for streamed bodies),
 `RequestID`, `Denial`, `LogDenial`, `LogPermit`, and the
 `RequestIDHeader`/`AuthorizedByHeader` constants.
 
+`middleware/fasthttp` is the worked example: about 200 lines, none of them
+about policy. Copy its shape.
+
 Conventions for a new adapter:
 
 - directory `middleware/<framework>`, package `plainid<framework>`;
@@ -292,10 +300,21 @@ Conventions for a new adapter:
 Frameworks that compose `func(http.Handler) http.Handler` — chi, gorilla/mux,
 `httputil.ReverseProxy` — need no adapter at all; use `middleware/nethttp`.
 
+Two details worth copying rather than rediscovering:
+
+- **Send the path as it arrived.** fasthttp's `ctx.Path()` is already
+  normalized and percent-decoded, so the adapter uses `URI().PathOriginal()`
+  to match what `net/http` sends. Policies must judge the caller's path, not
+  the framework's idea of it.
+- **The body limit still applies** even when the framework hands you the body
+  in memory: `AuthorizeRequest` enforces `MaxBodyBytes` itself, so an adapter
+  cannot forget it.
+
 ## Tests
 
 ```bash
-go test ./...
+go test ./...                              # core, net/http adapter, examples
+cd middleware/fasthttp && go test ./...     # the nested module has its own
 ```
 
 `internal/authztest` holds the acceptance suite every adapter must pass, plus
@@ -315,6 +334,11 @@ wire shape, denial uniformity, request-id correlation, one decision per
 request, declared exclusions, that permitted requests reach the backend
 unmodified, and that denied ones never reach it at all. Alongside it, unit
 tests cover the payload construction and every fail-closed path.
+
+Both adapters pass the identical suite — that is the point of it. The fasthttp
+module consumes `internal/authztest` across the module boundary and builds
+against the *published* core, so its tests also prove the released core is
+genuinely reusable.
 
 The library was also verified end to end with the gateway-agnostic acceptance
 suite (`verify_enforcement.py`) driving `examples/reverse-proxy` against a stub
