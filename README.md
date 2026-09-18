@@ -320,3 +320,7 @@ The library was also verified end to end with the gateway-agnostic acceptance
 suite (`verify_enforcement.py`) driving `examples/reverse-proxy` against a stub
 PDP: 13/13 checks passed, the backend's own log showed only the permitted
 calls, and with the PDP stopped every request was refused.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
