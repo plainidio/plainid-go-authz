@@ -6,7 +6,7 @@ module github.com/plainidio/plainid-go-authz/middleware/fasthttp
 go 1.22
 
 require (
-	github.com/plainidio/plainid-go-authz v0.1.0
+	github.com/plainidio/plainid-go-authz v1.0.0
 	github.com/valyala/fasthttp v1.58.0
 )
 
