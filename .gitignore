@@ -1,0 +1,48 @@
+# Binaries and build output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+# Compiled example servers, if built rather than `go run`
+/simple-server
+/reverse-proxy
+
+# Test and coverage output
+*.test
+*.out
+coverage.*
+/testdata/tmp/
+
+# Go workspace files — local to one machine
+go.work
+go.work.sum
+
+# Dependency directory, when vendoring is used locally
+/vendor/
+
+# Credentials and local configuration.
+# PLAINID_CLIENT_SECRET and caller tokens must never be committed.
+.env
+.env.*
+*.pem
+*.key
+secrets.*
+
+# Local scratch files
+requests.http
+*.local.http
+
+# Editors and IDEs.
+# .vscode/launch.json in particular holds PDP credentials in its env block.
+.vscode/
+.idea/
+*.swp
+*~
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+*.http
