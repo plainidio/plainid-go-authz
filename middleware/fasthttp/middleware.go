@@ -16,11 +16,11 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// Enforcer holds a configured authorizer and the fasthttp-specific options.
+// Enforcer holds a configured client and the fasthttp-specific options.
 // Create one per process and reuse it, so connections to the PDP are pooled.
 type Enforcer struct {
-	authorizer *plainid.Authorizer
-	skip       func(*fasthttp.RequestCtx) bool
+	client *plainid.Client
+	skip   func(*fasthttp.RequestCtx) bool
 }
 
 // Option configures an Enforcer.
@@ -42,7 +42,7 @@ func New(cfg plainid.Config, opts ...Option) (*Enforcer, error) {
 	if err != nil {
 		return nil, err
 	}
-	e := &Enforcer{authorizer: a}
+	e := &Enforcer{client: a}
 	for _, opt := range opts {
 		opt(e)
 	}
@@ -59,8 +59,15 @@ func Middleware(cfg plainid.Config, opts ...Option) (func(fasthttp.RequestHandle
 	return e.Handler, nil
 }
 
-// Authorizer returns the underlying core authorizer.
-func (e *Enforcer) Authorizer() *plainid.Authorizer { return e.authorizer }
+// Client returns the underlying core client, so a handler behind this
+// middleware can ask its own domain-level questions — Can, Check,
+// Permissions — without building a second client or a second connection pool.
+func (e *Enforcer) Client() *plainid.Client { return e.client }
+
+// Authorizer is the former name of Client.
+//
+// Deprecated: use Client.
+func (e *Enforcer) Authorizer() *plainid.Client { return e.client }
 
 // Handler wraps next with enforcement. Permitted requests reach next
 // unmodified apart from a normalized X-Request-ID and X-Authorized-By.
@@ -90,7 +97,7 @@ func (e *Enforcer) Handler(next fasthttp.RequestHandler) fasthttp.RequestHandler
 func (e *Enforcer) Authorize(ctx *fasthttp.RequestCtx) plainid.Decision {
 	req := request(ctx)
 
-	decision := e.authorizer.AuthorizeRequest(ctx, req)
+	decision := e.client.AuthorizeRequest(ctx, req)
 
 	// Stamp the request id before branching, not just on permit, so an outer
 	// middleware such as a request logger can correlate a denied request with
@@ -99,10 +106,10 @@ func (e *Enforcer) Authorize(ctx *fasthttp.RequestCtx) plainid.Decision {
 	setHeader(ctx, plainid.RequestIDHeader, decision.RequestID)
 
 	if !decision.Permit {
-		e.authorizer.LogDenial(req, decision)
+		e.client.LogDenial(req, decision)
 		return decision
 	}
-	e.authorizer.LogPermit(req, decision)
+	e.client.LogPermit(req, decision)
 
 	// The only other change enforcement makes to a permitted request.
 	ctx.Request.Header.Set(plainid.AuthorizedByHeader, plainid.AuthorizedByValue)
@@ -113,7 +120,7 @@ func (e *Enforcer) Authorize(ctx *fasthttp.RequestCtx) plainid.Decision {
 // and PDP outages are indistinguishable to the caller by design — the
 // difference belongs in the logs, not in the response.
 func (e *Enforcer) WriteDenial(ctx *fasthttp.RequestCtx, requestID string) {
-	denial := e.authorizer.Denial()
+	denial := e.client.Denial()
 	ctx.Response.Reset()
 	ctx.SetStatusCode(denial.StatusCode)
 	ctx.SetContentType(denial.ContentType)

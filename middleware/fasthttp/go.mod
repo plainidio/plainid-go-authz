@@ -15,3 +15,8 @@ require (
 	github.com/klauspost/compress v1.17.11 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 )
+
+// While the core's Client surface (permit-deny v3 and user access token) is
+// unreleased, this module builds against the working tree. Drop this line
+// once the core is tagged and the require above is bumped to it.
+replace github.com/plainidio/plainid-go-authz => ../..

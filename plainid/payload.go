@@ -85,18 +85,18 @@ type Payload struct {
 // BuildPayload turns a neutral Request into the decision payload. Adapters
 // rarely need it directly — AuthorizeRequest calls it — but it is exported so
 // a payload can be inspected or unit-tested on its own.
-func (a *Authorizer) BuildPayload(req Request, requestID string) Payload {
+func (c *Client) BuildPayload(req Request, requestID string) Payload {
 	p := Payload{
-		IPAddress:            a.cfg.clientIP(req),
+		IPAddress:            c.cfg.clientIP(req),
 		Method:               strings.ToUpper(req.Method),
 		Headers:              buildHeaders(req.Header),
 		RequestID:            requestID,
-		AuthenticationMethod: a.cfg.AuthMethod,
-		Meta:                 Meta{RuntimeFineTune: a.cfg.RuntimeFineTune},
+		AuthenticationMethod: c.cfg.AuthMethod,
+		Meta:                 Meta{RuntimeFineTune: c.cfg.RuntimeFineTune},
 		URI: URI{
 			Path:   buildPath(req.Path),
 			Query:  buildQuery(req.Query),
-			Schema: a.cfg.scheme(req),
+			Schema: c.cfg.scheme(req),
 		},
 	}
 	if len(req.Body) > 0 {
