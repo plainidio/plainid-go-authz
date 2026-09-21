@@ -255,8 +255,8 @@ func TestConfigValidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if a.endpoint != "https://pdp.example/api"+decisionPath {
-		t.Errorf("endpoint = %q", a.endpoint)
+	if a.endpoints.decision != "https://pdp.example/api"+decisionPath {
+		t.Errorf("endpoint = %q", a.endpoints.decision)
 	}
 	if c := a.Config(); c.RequestTimeout != DefaultRequestTimeout ||
 		c.OnPreventStatusCode != DefaultOnPreventStatus || c.MaxBodyBytes != DefaultMaxBodyBytes {

@@ -257,12 +257,12 @@ func TestAuthorizeStandalone(t *testing.T) {
 
 // The adapter must expose the core authorizer, so callers can enforce outside
 // a handler chain.
-func TestAuthorizerIsReachable(t *testing.T) {
+func TestClientIsReachable(t *testing.T) {
 	f := newFixture(t, permitAnswer)
-	if f.enforcer.Authorizer() == nil {
-		t.Fatal("Authorizer() returned nil")
+	if f.enforcer.Client() == nil {
+		t.Fatal("Client() returned nil")
 	}
-	if got := f.enforcer.Authorizer().Denial().StatusCode; got != http.StatusForbidden {
+	if got := f.enforcer.Client().Denial().StatusCode; got != http.StatusForbidden {
 		t.Errorf("denial status = %d, want 403", got)
 	}
 }

@@ -5,8 +5,12 @@
 // on it — chi, gorilla/mux, httputil.ReverseProxy — none of which need an
 // adapter of their own, since they all compose func(http.Handler) http.Handler.
 //
-// The decision itself lives in the core package; this one only translates
-// between net/http and plainid.Request, and writes the refusal.
+// The decision itself lives in the core package: this one only translates
+// between net/http and plainid.Request, and writes the refusal. It holds a
+// *plainid.Client — the same client your handlers use for Can and
+// Permissions — so route enforcement and in-handler checks share one
+// configuration, one pooled connection to the PDP, and one set of
+// fail-closed rules.
 package plainidhttp
 
 import (
@@ -16,11 +20,11 @@ import (
 	"github.com/plainidio/plainid-go-authz/plainid"
 )
 
-// Enforcer holds a configured authorizer and the net/http-specific options.
+// Enforcer holds a configured client and the net/http-specific options.
 // Create one per process and reuse it, so connections to the PDP are pooled.
 type Enforcer struct {
-	authorizer *plainid.Authorizer
-	skip       func(*http.Request) bool
+	client *plainid.Client
+	skip   func(*http.Request) bool
 }
 
 // Option configures an Enforcer.
@@ -42,7 +46,7 @@ func New(cfg plainid.Config, opts ...Option) (*Enforcer, error) {
 	if err != nil {
 		return nil, err
 	}
-	e := &Enforcer{authorizer: a}
+	e := &Enforcer{client: a}
 	for _, opt := range opts {
 		opt(e)
 	}
@@ -60,8 +64,15 @@ func Middleware(cfg plainid.Config, opts ...Option) (func(http.Handler) http.Han
 	return e.Handler, nil
 }
 
-// Authorizer returns the underlying core authorizer.
-func (e *Enforcer) Authorizer() *plainid.Authorizer { return e.authorizer }
+// Client returns the underlying core client, so a handler behind this
+// middleware can ask its own domain-level questions — Can, Check,
+// Permissions — without building a second client or a second connection pool.
+func (e *Enforcer) Client() *plainid.Client { return e.client }
+
+// Authorizer is the former name of Client.
+//
+// Deprecated: use Client.
+func (e *Enforcer) Authorizer() *plainid.Client { return e.client }
 
 // Handler wraps next with enforcement. Permitted requests reach next
 // byte-identical apart from a normalized X-Request-ID and X-Authorized-By.
@@ -94,16 +105,16 @@ func (e *Enforcer) Authorize(r *http.Request) plainid.Decision {
 		// A body that cannot be read or is over the limit cannot be fully
 		// inspected, so it cannot be authorized.
 		d := plainid.Decision{
-			RequestID: e.authorizer.RequestID(r.Header),
+			RequestID: e.client.RequestID(r.Header),
 			Reason:    "request body unusable",
 			Err:       err,
 		}
 		setHeaderFold(r.Header, plainid.RequestIDHeader, d.RequestID)
-		e.authorizer.LogDenial(req, d)
+		e.client.LogDenial(req, d)
 		return d
 	}
 
-	decision := e.authorizer.AuthorizeRequest(r.Context(), req)
+	decision := e.client.AuthorizeRequest(r.Context(), req)
 
 	// Stamp the request id before branching, not just on permit: the header
 	// map is shared with any outer middleware, so a logger wrapping this one
@@ -113,10 +124,10 @@ func (e *Enforcer) Authorize(r *http.Request) plainid.Decision {
 	setHeaderFold(r.Header, plainid.RequestIDHeader, decision.RequestID)
 
 	if !decision.Permit {
-		e.authorizer.LogDenial(req, decision)
+		e.client.LogDenial(req, decision)
 		return decision
 	}
-	e.authorizer.LogPermit(req, decision)
+	e.client.LogPermit(req, decision)
 
 	// The only other change enforcement makes to a permitted request.
 	r.Header.Set(plainid.AuthorizedByHeader, plainid.AuthorizedByValue)
@@ -136,7 +147,7 @@ func (e *Enforcer) request(r *http.Request) (plainid.Request, error) {
 		RemoteAddr: r.RemoteAddr,
 	}
 
-	body, err := plainid.ReadCappedBody(bodyReader(r), e.authorizer.Config().MaxBodyBytes)
+	body, err := plainid.ReadCappedBody(bodyReader(r), e.client.Config().MaxBodyBytes)
 	if err != nil {
 		r.Body.Close()
 		return req, err
@@ -156,7 +167,7 @@ func (e *Enforcer) WriteDenial(w http.ResponseWriter, requestID string) {
 }
 
 func (e *Enforcer) deny(w http.ResponseWriter, requestID string) {
-	denial := e.authorizer.Denial()
+	denial := e.client.Denial()
 	h := w.Header()
 	h.Set("Content-Type", denial.ContentType)
 	if requestID != "" {

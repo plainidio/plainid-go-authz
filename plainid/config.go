@@ -1,19 +1,46 @@
-// Package plainid authorizes HTTP requests against a PlainID PDP (Policy
-// Decision Point), mirroring the behaviour of the PlainID API Gateway policy.
+// Package plainid is a client for the PlainID Runtime Authorization APIs, for
+// Go applications that need to decide what a user may do.
 //
-// It makes exactly one decision call per request, permits only when the PDP
-// answers with the exact string "PERMIT", and fails closed on every other
-// outcome (outage, timeout, non-200, unparseable response, oversized body).
+// One Client, three questions — pick by what the call site is actually asking:
 //
-// This package is framework-neutral: it works with plainid.Request, a plain
-// description of an inbound call. The web-framework middleware lives
-// alongside it, one package per framework:
+//	Client.Can / Client.Check    may this user do this to this object?
+//	                             (permit-deny v3; the per-call workhorse)
+//	Client.Permissions           what may this user do at all?
+//	                             (user access token; session-scoped)
+//	Client.AuthorizeRequest      may this caller make this HTTP request?
+//	                             (decisions 5.0; what the middleware uses)
 //
-//	middleware/nethttp   net/http, and anything that speaks it (chi,
-//	                     gorilla/mux, httputil.ReverseProxy)
+// Choosing between them is the decision that matters, because a wrong choice
+// is not a bug: the code works, and is either slow or quietly permissive. Use
+// Can where a domain object is loaded. Use Permissions at session start, for
+// menus and buttons — never to authorize a consequential write, since it is a
+// snapshot that goes stale the moment policy changes. Use AuthorizeRequest in
+// a route guard, where policy is authored against the HTTP surface.
+//
+// Every one of them fails closed. A permit requires HTTP 200 and the exact
+// string PERMIT; an unreachable PDP, a timeout, a non-200, an unparseable
+// body and a missing result are all refusals. The token API's closed answer
+// is an empty permission map, which permits nothing.
+//
+// Call sites speak your application's language; only this package speaks
+// PlainID's. Map a domain user onto Identity and a domain object onto
+// Resource in one place each — those two mappings are where nearly all real
+// bugs live — and entityTypeId, assetAttributes and the rest never leak into
+// your handlers.
+//
+// Where callers already arrive with a JWT, the identity mapping goes away
+// entirely: IdentityFromToken forwards the token and the PDP resolves who the
+// caller is, so entityId and entityTypeId are neither required nor sent.
+//
+// The framework middleware lives alongside, one package per framework, and
+// uses the same Client:
+//
+//	middleware/nethttp    net/http, and anything that speaks it (chi,
+//	                      gorilla/mux, httputil.ReverseProxy)
+//	middleware/fasthttp   fasthttp
 //
 // To support a framework of your own, translate its request into
-// plainid.Request and call Authorizer.AuthorizeRequest; everything about the
+// plainid.Request and call Client.AuthorizeRequest; everything about the
 // decision — payload shape, fail-closed rules, the uniform denial — stays
 // here rather than being reimplemented per framework.
 package plainid
@@ -24,6 +51,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -51,10 +79,10 @@ const (
 	DefaultMaxBodyBytes     = 1 << 20 // 1 MiB
 	DefaultClientIDHeader   = "X-Client-Id"
 	DefaultClientSecretHead = "X-Client-Secret"
-	decisionPath            = "/runtime/5.0/decisions/permit-deny"
-	requestIDHeader         = "X-Request-ID"
-	authorizedByHeader      = "X-Authorized-By"
-	authorizedByValue       = "PlainID"
+
+	// DefaultIdentityTokenHeader is where an end user's JWT is sent on the v3
+	// endpoints when Identity.Token is set.
+	DefaultIdentityTokenHeader = "Authorization"
 )
 
 // noneLiteral is treated as "not set", so one configuration transfers
@@ -73,8 +101,49 @@ type Config struct {
 	// ClientSecret is required when AuthMethod is "secret".
 	ClientSecret string
 
-	// AuthMethod is "token" (default) or "secret".
+	// AuthMethod is "token" (default) or "secret". It decides how the 5.0
+	// request path authenticates: "token" forwards the caller's own
+	// Authorization header to the PDP, "secret" authenticates this
+	// application with client credentials.
 	AuthMethod string
+
+	// BearerToken authenticates this application to the PDP with a token
+	// rather than a secret, for the v3 endpoints (Can, Check, Permissions).
+	// Per-call overrides live on Query.BearerToken and TokenQuery.BearerToken.
+	BearerToken string
+
+	// IdentityTokenHeader names the header carrying the end user's JWT when
+	// Identity.Token is set — "Authorization" by default. Change it where the
+	// tenant reads the identity from somewhere else, or where this
+	// application authenticates itself with a bearer token and the two would
+	// otherwise collide.
+	IdentityTokenHeader string
+
+	// EntityTypeID is the default identity template id, used whenever an
+	// Identity does not carry its own. A wrong value denies everything —
+	// confirm it against the tenant before blaming your code.
+	EntityTypeID string
+
+	// UseCache is sent as useCache on the v3 endpoints, letting the PDP reuse
+	// its own calculation. Nil means true. Turn it off while testing policy
+	// changes, or you will debug stale answers.
+	//
+	// This is the PDP's cache, not a local one. This client keeps no local
+	// decision cache: a permit-deny verdict can depend on asset attributes,
+	// context, environment and time, so a cache keyed on less than the whole
+	// request authorizes the wrong thing.
+	UseCache *bool
+
+	// IncludeDetails asks the v3 permit-deny endpoint for the per-resource
+	// breakdown (Decision.Allowed / Denied / NotApplicable). Useful in
+	// development and in logs; it makes responses much larger, so leaving it
+	// on at volume costs real bandwidth.
+	IncludeDetails bool
+
+	// IncludeDenyReason asks the PDP why it denied. Invaluable while
+	// building. Treat the reason as internal — surfacing it to end users
+	// leaks policy structure.
+	IncludeDenyReason bool
 
 	// ClientIDHeader / ClientSecretHeader name the credential headers.
 	// Deployments differ: X-Client-Id/X-Client-Secret and
@@ -118,6 +187,10 @@ type Config struct {
 	// than the decision itself.
 	HTTPClient *http.Client
 
+	// missingAPIPrefix records that the base URL carried no path at all, so
+	// normalize can say so once at startup rather than per request.
+	missingAPIPrefix bool
+
 	// TrustForwardedHeaders resolves ipAddress from X-Forwarded-For and
 	// uri.schema from X-Forwarded-Proto. Only enable it when the gateway sits
 	// behind a proxy you control — these headers are caller-supplied
@@ -127,20 +200,27 @@ type Config struct {
 
 // ConfigFromEnv reads the canonical environment variables:
 //
-//	PLAINID_URL, PLAINID_CLIENT_ID, PLAINID_CLIENT_SECRET, PLAINID_AUTH_METHOD,
+//	PLAINID_URL, PLAINID_CLIENT_ID, PLAINID_CLIENT_SECRET, PLAINID_BEARER_TOKEN,
+//	PLAINID_AUTH_METHOD, PLAINID_ENTITY_TYPE_ID, PLAINID_IDENTITY_TOKEN_HEADER,
+//	PLAINID_USE_CACHE,
+//	PLAINID_INCLUDE_DETAILS, PLAINID_INCLUDE_DENY_REASON,
 //	PLAINID_RUNTIME_FINE_TUNE, PLAINID_HEADERS_TO_FORWARD,
 //	PLAINID_REQUEST_TIMEOUT (seconds), PLAINID_CLIENT_ID_HEADER,
 //	PLAINID_CLIENT_SECRET_HEADER, ON_PREVENT_STATUS_CODE, ON_PREVENT_BODY,
 //	ON_PREVENT_CONTENT_TYPE, ENABLE_TRACING, MAX_BODY_BYTES,
 //	PLAINID_TRUST_FORWARDED_HEADERS
 //
-// The literal "none" means "not set".
+// The literal "none" means "not set". Secrets belong in the environment or a
+// secret manager, never in source.
 func ConfigFromEnv() (Config, error) {
 	c := Config{
 		URL:                  env("PLAINID_URL"),
 		ClientID:             env("PLAINID_CLIENT_ID"),
 		ClientSecret:         env("PLAINID_CLIENT_SECRET"),
+		BearerToken:          env("PLAINID_BEARER_TOKEN"),
 		AuthMethod:           env("PLAINID_AUTH_METHOD"),
+		EntityTypeID:         env("PLAINID_ENTITY_TYPE_ID"),
+		IdentityTokenHeader:  env("PLAINID_IDENTITY_TOKEN_HEADER"),
 		ClientIDHeader:       env("PLAINID_CLIENT_ID_HEADER"),
 		ClientSecretHeader:   env("PLAINID_CLIENT_SECRET_HEADER"),
 		OnPreventBody:        env("ON_PREVENT_BODY"),
@@ -180,6 +260,11 @@ func ConfigFromEnv() (Config, error) {
 		}
 		c.MaxBodyBytes = n
 	}
+	if v := env("PLAINID_USE_CACHE"); v != "" {
+		c.UseCache = Bool(envBool("PLAINID_USE_CACHE"))
+	}
+	c.IncludeDetails = envBool("PLAINID_INCLUDE_DETAILS")
+	c.IncludeDenyReason = envBool("PLAINID_INCLUDE_DENY_REASON")
 	c.EnableTracing = envBool("ENABLE_TRACING")
 	c.TrustForwardedHeaders = envBool("PLAINID_TRUST_FORWARDED_HEADERS")
 
@@ -210,6 +295,16 @@ func (c Config) normalize() (Config, error) {
 		return c, errors.New("plainid: URL is required")
 	}
 	c.URL = strings.TrimRight(c.URL, "/")
+	// The base URL is used exactly as given: every runtime path is appended
+	// to it verbatim. Guessing a missing /api would break self-hosted
+	// deployments that serve the API at the root, so say something instead —
+	// a base URL missing /api 404s every call, and a client that fails closed
+	// turns that into a blanket deny with nothing in any log to explain it.
+	if u, err := url.Parse(c.URL); err != nil || u.Scheme == "" || u.Host == "" {
+		return c, fmt.Errorf("plainid: URL must be absolute, got %q", c.URL)
+	} else if !strings.HasSuffix(u.Path, "/api") && u.Path == "" {
+		c.missingAPIPrefix = true
+	}
 
 	switch c.AuthMethod {
 	case "":
@@ -228,6 +323,9 @@ func (c Config) normalize() (Config, error) {
 	}
 	if c.ClientSecretHeader == "" {
 		c.ClientSecretHeader = DefaultClientSecretHead
+	}
+	if c.IdentityTokenHeader == "" {
+		c.IdentityTokenHeader = DefaultIdentityTokenHeader
 	}
 	if c.RuntimeFineTune == nil {
 		c.RuntimeFineTune = map[string]any{}
@@ -253,5 +351,19 @@ func (c Config) normalize() (Config, error) {
 	if c.HTTPClient == nil {
 		c.HTTPClient = defaultHTTPClient(c.RequestTimeout)
 	}
+	if c.missingAPIPrefix {
+		c.Logger.Warn("plainid: base URL has no path; PlainID cloud tenants serve the runtime API under /api",
+			"url", c.URL, "hint", c.URL+"/api")
+	}
 	return c, nil
+}
+
+// useCache reports the configured value of the v3 useCache flag, which
+// defaults to true: the PDP reusing its own calculation is nearly free, and
+// is the first performance lever to reach for.
+func (c Config) useCache() bool {
+	if c.UseCache == nil {
+		return true
+	}
+	return *c.UseCache
 }

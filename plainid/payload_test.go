@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func testAuthorizer(t *testing.T, cfg Config) *Authorizer {
+func testAuthorizer(t *testing.T, cfg Config) *Client {
 	t.Helper()
 	if cfg.URL == "" {
 		cfg.URL = "https://pdp.example/api"
